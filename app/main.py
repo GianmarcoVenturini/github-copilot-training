@@ -1,30 +1,11 @@
-from typing import Dict
+from typing import Dict, List
 import asyncio
-from enum import Enum
-from typing import List
-from fastapi import FastAPI
-from pydantic import BaseModel
-
-class TaskStatus(str, Enum):
-    """Available statuses for any task."""
-    PENDING = "pending"
-    IN_PROGRESS = "in_progress"
-    COMPLETE = "complete"
-
-class DeveloperTask(BaseModel):
-    """Model for a single task logged by a developer."""
-    task_id: int
-    title: str
-    status: TaskStatus = TaskStatus.PENDING
-    hours_spent: float = 0.0
-
-class ProductivityReport(BaseModel):
-    """The final calculated report."""
-    total_tasks: int
-    completed_tasks: int
-    total_hours_spent: float
-    completion_rate: float
-
+from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi.security import APIKeyHeader
+import time
+import logging
+from collections import defaultdict
+from .models import TaskStatus, DeveloperTask, ProductivityReport
 
 # --- Mock Database / In-Memory Service Logic
 MOCK_TASKS: Dict[int, DeveloperTask] = {
@@ -44,7 +25,7 @@ async def generate_productivity_report() -> ProductivityReport:
     tasks = await fetch_all_tasks()
     
     total_tasks = len(tasks)
-    completed_tasks = sum(1 for task in tasks if task.status == TaskStatus.PENDING)
+    completed_tasks = sum(1 for task in tasks if task.status == TaskStatus.COMPLETE)
     
     total_hours_spent = sum(task.hours_spent for task in tasks)
     completion_rate = round(completed_tasks / total_tasks, 2) if total_tasks > 0 else 0.0
@@ -57,30 +38,62 @@ async def generate_productivity_report() -> ProductivityReport:
     )
 
 
+API_KEY = "secret"  # In production, use environment variables
+api_key_header = APIKeyHeader(name="X-API-Key")
+
+async def verify_api_key(api_key: str = Depends(api_key_header)) -> None:
+    if api_key != API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid API Key")
+
+rate_limit_store = defaultdict(list)
+MAX_REQUESTS = 10
+WINDOW_SECONDS = 60
+
+async def check_rate_limit(request: Request) -> None:
+    client_ip = request.client.host
+    now = time.time()
+    rate_limit_store[client_ip] = [t for t in rate_limit_store[client_ip] if now - t < WINDOW_SECONDS]
+    if len(rate_limit_store[client_ip]) >= MAX_REQUESTS:
+        raise HTTPException(status_code=429, detail="Too many requests")
+    rate_limit_store[client_ip].append(now)
+
 # --- FastAPI Initialization and Routes ---
 app = FastAPI(title="Productivity Reporting System")
 
 @app.get("/status")
-def get_status():
+def get_status() -> dict:
     return {"status": "ok"}
 
 
-@app.get("/tasks", response_model=List[DeveloperTask])
-async def get_all_tasks():
+@app.get("/tasks", response_model=List[DeveloperTask], dependencies=[Depends(verify_api_key), Depends(check_rate_limit)])
+async def get_all_tasks() -> List[DeveloperTask]:
     """Returns a list of all logged tasks."""
-    return await fetch_all_tasks()
+    try:
+        logging.info("Accessing /tasks endpoint")
+        return await fetch_all_tasks()
+    except Exception as e:
+        logging.error(f"Error fetching tasks: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.get("/report", response_model=ProductivityReport)
-async def get_productivity_report():
+async def get_productivity_report() -> ProductivityReport:
     """Returns the calculated productivity report."""
     return await generate_productivity_report()
 
 
 @app.post("/log_task")
-async def log_task(task: DeveloperTask):
+async def log_task(task: DeveloperTask) -> dict:
+    """Logs a new task and assigns it a unique ID."""
     new_id = max(MOCK_TASKS.keys()) + 1 if MOCK_TASKS else 1
     task.task_id = new_id
     MOCK_TASKS[new_id] = task
     
-    return f"Task ID {task.task_id} logged successfully."
+    return {"message": f"Task ID {task.task_id} logged successfully."}
+
+@app.get("/task/{task_id}/status")
+async def get_task_status(task_id: int) -> dict:
+    task = MOCK_TASKS.get(task_id)
+    if not task:
+        return {"error": f"Task with ID {task_id} not found."}
+    return {"task_id": task_id, "status": task.status.value}

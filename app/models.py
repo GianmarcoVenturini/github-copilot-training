@@ -7,9 +7,11 @@ class TaskStatus(str, Enum):
     IN_PROGRESS = "in_progress"
     COMPLETE = "complete"
 
+from typing import Optional
+
 class DeveloperTask(BaseModel):
     """Model for a single task logged by a developer."""
-    task_id: int
+    task_id: Optional[int] = None
     title: str
     status: TaskStatus = TaskStatus.PENDING
     hours_spent: float = 0.0
